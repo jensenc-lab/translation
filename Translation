@@ -1,0 +1,267 @@
+
+
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { GoogleGenAI, LiveServerMessage, Modality, LiveSession } from '@google/genai';
+import { LANGUAGES } from './constants';
+import type { Language, TranscriptionTurn } from './types';
+import { encode, decode, decodeAudioData } from './utils/audio';
+
+// --- Helper Components defined outside App to prevent re-creation on re-renders ---
+
+const MicIcon: React.FC<{ className?: string }> = ({ className }) => (
+  <svg className={className} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+    <path d="M12 2a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3ZM11 5a1 1 0 0 1 2 0v8a1 1 0 0 1-2 0V5Z"></path>
+    <path d="M12 15a5 5 0 0 0 5-5h-2a3 3 0 0 1-6 0H7a5 5 0 0 0 5 5Z"></path>
+    <path d="M19 10h-2a1 1 0 1 0 0 2h2a1 1 0 1 0 0-2Zm-1 4a1 1 0 0 0-1 1v1a3 3 0 0 1-3 3h-2a3 3 0 0 1-3-3v-1a1 1 0 1 0-2 0v1a5 5 0 0 0 4 4.9V22h-2a1 1 0 1 0 0 2h6a1 1 0 1 0 0-2h-2v-2.1A5 5 0 0 0 18 16v-1a1 1 0 0 0-1-1Z"></path>
+  </svg>
+);
+
+const StopIcon: React.FC<{ className?: string }> = ({ className }) => (
+  <svg className={className} xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
+    <path d="M8 8H16V16H8V8Z"></path>
+    <path fillRule="evenodd" d="M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22ZM12 20C16.4183 20 20 16.4183 20 12C20 7.58172 16.4183 4 12 4C7.58172 4 4 7.58172 4 12C4 16.4183 7.58172 20 12 20Z" clipRule="evenodd"></path>
+  </svg>
+);
+
+interface LanguageSelectorProps {
+  selectedLanguage: Language;
+  onLanguageChange: (language: Language) => void;
+  disabled: boolean;
+}
+
+const LanguageSelector: React.FC<LanguageSelectorProps> = ({ selectedLanguage, onLanguageChange, disabled }) => (
+  <div className="relative">
+    <select
+      value={selectedLanguage.code}
+      onChange={(e) => {
+        const newLang = LANGUAGES.find(l => l.code === e.target.value);
+        if (newLang) onLanguageChange(newLang);
+      }}
+      disabled={disabled}
+      className="appearance-none w-full bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 py-3 px-4 pr-8 rounded-lg leading-tight focus:outline-none focus:bg-white dark:focus:bg-gray-800 focus:border-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed"
+    >
+      {LANGUAGES.map(lang => <option key={lang.code} value={lang.code}>{lang.name}</option>)}
+    </select>
+    <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700 dark:text-gray-200">
+      <svg className="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z" /></svg>
+    </div>
+  </div>
+);
+
+interface TranscriptionPanelProps {
+  title: string;
+  turns: TranscriptionTurn[];
+  currentText: string;
+}
+
+const TranscriptionPanel: React.FC<TranscriptionPanelProps> = ({ title, turns, currentText }) => {
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [turns, currentText]);
+
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-xl shadow-md p-6 h-full flex flex-col">
+      <h2 className="text-xl font-bold text-gray-800 dark:text-white mb-4">{title}</h2>
+      <div ref={scrollRef} className="flex-grow overflow-y-auto pr-2 -mr-2">
+        {turns.map(turn => (
+          <p key={turn.id} className="mb-3 text-gray-600 dark:text-gray-300 text-lg leading-relaxed">{turn.text}</p>
+        ))}
+        {currentText && <p className="mb-3 text-gray-900 dark:text-white text-lg leading-relaxed font-semibold">{currentText}</p>}
+      </div>
+    </div>
+  );
+};
+
+
+// --- Main App Component ---
+
+export default function App() {
+  const [isRecording, setIsRecording] = useState(false);
+  const [targetLanguage, setTargetLanguage] = useState<Language>(LANGUAGES[0]);
+  const [error, setError] = useState<string | null>(null);
+  
+  const [teacherTurns, setTeacherTurns] = useState<TranscriptionTurn[]>([]);
+  const [translatedTurns, setTranslatedTurns] = useState<TranscriptionTurn[]>([]);
+  const [currentTeacherText, setCurrentTeacherText] = useState('');
+  const [currentTranslatedText, setCurrentTranslatedText] = useState('');
+
+  const sessionPromiseRef = useRef<Promise<LiveSession> | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+
+  const currentTeacherTextRef = useRef('');
+  const currentTranslatedTextRef = useRef('');
+  let nextTurnId = useRef(0);
+
+  const handleToggleRecording = useCallback(async () => {
+    if (isRecording) {
+      setIsRecording(false);
+      
+      sessionPromiseRef.current?.then(session => session.close());
+      sessionPromiseRef.current = null;
+
+      streamRef.current?.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+      
+      scriptProcessorRef.current?.disconnect();
+      scriptProcessorRef.current = null;
+
+      audioContextRef.current?.close();
+      audioContextRef.current = null;
+      
+    } else {
+      setError(null);
+      setCurrentTeacherText('');
+      setCurrentTranslatedText('');
+      setTeacherTurns([]);
+      setTranslatedTurns([]);
+      currentTeacherTextRef.current = '';
+      currentTranslatedTextRef.current = '';
+      nextTurnId.current = 0;
+
+      try {
+        if (!process.env.API_KEY) {
+            throw new Error("API key not found. Please ensure it's set in your environment variables.");
+        }
+        const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+        streamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+        
+        setIsRecording(true);
+
+        const systemInstruction = `You are a real-time translator for a classroom. The user is a teacher speaking English.
+        Translate EVERYTHING the user says from English to ${targetLanguage.name}.
+        Respond ONLY with the translated audio. Do not add any commentary or introductory phrases. Be direct and accurate.`;
+        
+        sessionPromiseRef.current = ai.live.connect({
+          model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+          config: {
+            systemInstruction: systemInstruction,
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            responseModalities: [Modality.AUDIO],
+          },
+          callbacks: {
+            onopen: () => {
+              // FIX: Cast window to `any` to access vendor-prefixed `webkitAudioContext` for broader browser support.
+              const inputAudioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+              audioContextRef.current = inputAudioContext;
+              const source = inputAudioContext.createMediaStreamSource(streamRef.current!);
+              const scriptProcessor = inputAudioContext.createScriptProcessor(4096, 1, 1);
+              scriptProcessorRef.current = scriptProcessor;
+
+              scriptProcessor.onaudioprocess = (audioProcessingEvent) => {
+                const inputData = audioProcessingEvent.inputBuffer.getChannelData(0);
+                const l = inputData.length;
+                const int16 = new Int16Array(l);
+                for (let i = 0; i < l; i++) {
+                    int16[i] = inputData[i] * 32768;
+                }
+                const pcmBlob = {
+                  data: encode(new Uint8Array(int16.buffer)),
+                  mimeType: 'audio/pcm;rate=16000',
+                };
+                sessionPromiseRef.current?.then(session => session.sendRealtimeInput({ media: pcmBlob }));
+              };
+              source.connect(scriptProcessor);
+              scriptProcessor.connect(inputAudioContext.destination);
+            },
+            onmessage: (message: LiveServerMessage) => {
+                if (message.serverContent?.inputTranscription) {
+                    currentTeacherTextRef.current += message.serverContent.inputTranscription.text;
+                    setCurrentTeacherText(currentTeacherTextRef.current);
+                }
+                if (message.serverContent?.outputTranscription) {
+                    currentTranslatedTextRef.current += message.serverContent.outputTranscription.text;
+                    setCurrentTranslatedText(currentTranslatedTextRef.current);
+                }
+                if (message.serverContent?.turnComplete) {
+                    const id = nextTurnId.current++;
+                    const teacherText = currentTeacherTextRef.current.trim();
+                    const translatedText = currentTranslatedTextRef.current.trim();
+
+                    if(teacherText) {
+                      setTeacherTurns(prev => [...prev, { id, text: teacherText }]);
+                    }
+                    if(translatedText) {
+                      setTranslatedTurns(prev => [...prev, { id, text: translatedText }]);
+                    }
+
+                    currentTeacherTextRef.current = '';
+                    currentTranslatedTextRef.current = '';
+                    setCurrentTeacherText('');
+                    setCurrentTranslatedText('');
+                }
+
+                // Note: We are not playing back the audio as the focus is on captions.
+            },
+            onerror: (e: ErrorEvent) => {
+              console.error(e);
+              setError(`An error occurred: ${e.message}. Please try again.`);
+              setIsRecording(false);
+            },
+            onclose: () => {
+              setIsRecording(false);
+            },
+          }
+        });
+
+      } catch (err: any) {
+        console.error(err);
+        setError(err.message || 'Failed to start recording.');
+        setIsRecording(false);
+      }
+    }
+  }, [isRecording, targetLanguage.name]);
+
+
+  return (
+    <div className="min-h-screen text-gray-800 dark:text-gray-200 flex flex-col font-sans">
+      <header className="w-full p-4 border-b border-gray-200 dark:border-gray-700">
+        <div className="max-w-7xl mx-auto flex justify-between items-center">
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">
+            Classroom Translation Captions
+          </h1>
+        </div>
+      </header>
+
+      <main className="flex-grow w-full max-w-7xl mx-auto p-4 md:p-8 flex flex-col">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-8 flex-grow">
+          <TranscriptionPanel title="English (What you said)" turns={teacherTurns} currentText={currentTeacherText} />
+          <TranscriptionPanel title={`${targetLanguage.name} (Translation)`} turns={translatedTurns} currentText={currentTranslatedText} />
+        </div>
+      </main>
+
+      <footer className="w-full p-4 sticky bottom-0 bg-gray-100/80 dark:bg-gray-900/80 backdrop-blur-sm border-t border-gray-200 dark:border-gray-700">
+        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-center gap-6">
+          {error && <p className="text-red-500 text-center">{error}</p>}
+          <div className="w-full sm:w-auto sm:max-w-xs">
+            <LanguageSelector selectedLanguage={targetLanguage} onLanguageChange={setTargetLanguage} disabled={isRecording} />
+          </div>
+          <button
+            onClick={handleToggleRecording}
+            className={`flex items-center justify-center gap-3 w-48 h-14 px-6 font-semibold rounded-full text-white transition-all duration-300 ease-in-out transform hover:scale-105
+              ${isRecording ? 'bg-red-600 hover:bg-red-700' : 'bg-indigo-600 hover:bg-indigo-700'}`}
+          >
+            {isRecording ? (
+              <>
+                <StopIcon className="w-6 h-6" />
+                <span>Stop</span>
+              </>
+            ) : (
+              <>
+                <MicIcon className="w-6 h-6" />
+                <span>Start</span>
+              </>
+            )}
+          </button>
+        </div>
+      </footer>
+    </div>
+  );
+}
