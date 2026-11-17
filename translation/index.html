@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Live English to Spanish Classroom Translator</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: #f4f6f8;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    button {
+      padding: 12px 22px;
+      font-size: 20px;
+      font-weight: bold;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    #startBtn { background: #1a73e8; color: white; }
+    #startBtn:disabled { background: #a8c7fa; cursor: not-allowed; }
+    #stopBtn { background: #d93025; color: white; }
+    #stopBtn:disabled { background: #f2b8b5; cursor: not-allowed; }
+    .secondary-btn { background: #e0e0e0; color: #222; }
+    #status {
+      font-size: 22px;
+      font-weight: bold;
+      margin-left: 8px;
+      color: #555;
+    }
+    .panels {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      flex: 1;
+      min-height: 0;
+    }
+    .box {
+      background: white;
+      border: 2px solid #ccc;
+      border-radius: 12px;
+      padding: 20px 24px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+    }
+    .english-box { flex: 1; }
+    .spanish-box {
+      flex: 2;
+      border-color: #1a73e8;
+      background: #ffffff;
+    }
+    .box-label {
+      font-size: 18px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #666;
+      margin-bottom: 10px;
+      font-weight: bold;
+    }
+    #english-text {
+      font-size: 32px;
+      line-height: 1.35;
+      color: #333;
+    }
+    #english-interim {
+      color: #888;
+      font-style: italic;
+    }
+    #spanish-text {
+      font-size: 54px;
+      line-height: 1.35;
+      color: #111;
+      font-weight: 500;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="toolbar">
+    <button id="startBtn" onclick="startListening()">Start Speaking</button>
+    <button id="stopBtn" onclick="stopListening()" disabled>Stop</button>
+    <button class="secondary-btn" onclick="clearText()">Clear Screen</button>
+    <button class="secondary-btn" onclick="changeSize(-6)">A-</button>
+    <button class="secondary-btn" onclick="changeSize(6)">A+</button>
+    <span id="status">Ready</span>
+  </div>
+
+  <div class="panels">
+    <div class="box english-box" id="english-container">
+      <div class="box-label">English (Heard)</div>
+      <div id="english-text"><span id="english-final"></span> <span id="english-interim"></span></div>
+    </div>
+
+    <div class="box spanish-box" id="spanish-container">
+      <div class="box-label">Spanish (Translated)</div>
+      <div id="spanish-text"></div>
+    </div>
+  </div>
+
+  <script>
+    // Optional: Paste your Google Apps Script Web App URL between the quotes below
+    const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzAi7cTDiFWGlNwsAEOgOlzjOCD1QYNTzeo0Rbxtjmj5M8ij57cKUV_LOrVc-9mJxgm/exec";
+
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
+
+    let isListening = false;
+    let spanishFontSize = 54;
+
+    const englishFinal = document.getElementById('english-final');
+    const englishInterim = document.getElementById('english-interim');
+    const spanishText = document.getElementById('spanish-text');
+    const statusEl = document.getElementById('status');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+
+    recognition.onstart = function() {
+      statusEl.style.color = "#d93025";
+      statusEl.innerText = "● Listening...";
+    };
+
+    recognition.onresult = function(event) {
+      let interimTranscript = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          englishFinal.innerText += " " + transcript.trim();
+          englishInterim.innerText = "";
+          scrollToBottom('english-container');
+          translateText(transcript.trim());
+        } else {
+          interimTranscript += transcript;
+        }
+      }
+      englishInterim.innerText = interimTranscript;
+    };
+
+    recognition.onerror = function(event) {
+      if (event.error === 'no-speech' || event.error === 'aborted') return;
+      isListening = false;
+      statusEl.style.color = "#d93025";
+      if (event.error === 'not-allowed') {
+        statusEl.innerText = "Microphone blocked — allow microphone access in Chrome's address bar.";
+      } else {
+        statusEl.innerText = "Error: " + event.error;
+      }
+      resetButtons();
+    };
+
+    // Automatically keep listening if Chrome pauses after silence
+    recognition.onend = function() {
+      if (isListening) {
+        try { recognition.start(); } catch (e) {}
+      } else {
+        statusEl.style.color = "#555";
+        statusEl.innerText = "Stopped";
+        resetButtons();
+      }
+    };
+
+    async function translateText(text) {
+      if (!text) return;
+      try {
+        if (APPS_SCRIPT_URL) {
+          const res = await fetch(APPS_SCRIPT_URL + "?text=" + encodeURIComponent(text));
+          const data = await res.json();
+          if (data.translated) {
+            appendSpanish(data.translated);
+            return;
+          }
+        }
+      } catch (e) {
+        // Falls back automatically if Apps Script URL is blank or restricted by school network
+      }
+
+      try {
+        const fallbackUrl = "https://api.mymemory.translated.net/get?q=" + encodeURIComponent(text) + "&langpair=en|es";
+        const res = await fetch(fallbackUrl);
+        const data = await res.json();
+        if (data && data.responseData && data.responseData.translatedText) {
+          appendSpanish(data.responseData.translatedText);
+        }
+      } catch (err) {
+        console.error("Translation failed:", err);
+      }
+    }
+
+    function appendSpanish(translated) {
+      spanishText.innerText += " " + translated;
+      scrollToBottom('spanish-container');
+    }
+
+    function scrollToBottom(id) {
+      const el = document.getElementById(id);
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function startListening() {
+      isListening = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      recognition.start();
+    }
+
+    function stopListening() {
+      isListening = false;
+      recognition.stop();
+      resetButtons();
+    }
+
+    function resetButtons() {
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    }
+
+    function clearText() {
+      englishFinal.innerText = "";
+      englishInterim.innerText = "";
+      spanishText.innerText = "";
+    }
+
+    function changeSize(delta) {
+      spanishFontSize = Math.max(24, Math.min(96, spanishFontSize + delta));
+      spanishText.style.fontSize = spanishFontSize + "px";
+      document.getElementById('english-text').style.fontSize = Math.round(spanishFontSize * 0.6) + "px";
+    }
+  </script>
+</body>
+</html>
